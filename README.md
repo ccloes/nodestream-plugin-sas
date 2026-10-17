@@ -1,9 +1,9 @@
 # nodestream-plugin-sas
 
-Reads `.sas7bdat` files from Nodestream's `FileExtractor`.
+Reads `.sas7bdat` files with a Nodestream extractor.
 
 ```yaml
-- implementation: nodestream.pipeline.extractors.files:FileExtractor
+- implementation: nodestream_plugin_sas:Sas7bdatExtractor
   arguments:
     globs:
       - data/*.sas7bdat
@@ -15,17 +15,19 @@ Install Nodestream, then this plugin:
 pip install nodestream nodestream-plugin-sas
 ```
 
-`FileExtractor` loads the `file_formats` entry point, so a `.sas7bdat` file is read without naming the plugin in the pipeline. `.SAS7BDAT` uses the same codec. `.gz`, `.bz2`, and `.zip` are handled by Nodestream before this codec sees the member.
+With Poetry:
+
+```bash
+poetry add nodestream nodestream-plugin-sas
+```
+
+Name `Sas7bdatExtractor` in the pipeline. `.SAS7BDAT` is read the same way as `.sas7bdat`. `.gz` and `.bz2` are decompressed first. A `.zip` yields each sas7bdat member and skips the other members. `chunksize` defaults to 10000.
 
 Each row is a dictionary keyed by column name. SAS numbers stay floats, including whole numbers such as `2.0`. Missing values are `None`. SAS dates and datetimes are Python `datetime` objects. Text uses the encoding declared in the file. A byte that does not fit that encoding is replaced, and the rest of the file is still read.
-
-This plugin needs a Nodestream build that imports `file_formats` plugins when a `FileExtractor` is created. That hook is on `cursor/file-format-plugins-f892` in [ccloes/nodestream](https://github.com/ccloes/nodestream) until it is released.
 
 ## Tests
 
 ```bash
-pip install -e /path/to/nodestream
-pip install -e . --no-deps
-pip install pytest pytest-asyncio pytest-mock
-pytest
+poetry install
+poetry run pytest
 ```

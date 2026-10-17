@@ -3,23 +3,19 @@ import gzip
 import logging
 import zipfile
 from datetime import datetime
-from importlib.metadata import entry_points
 from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
 import pytest
-from nodestream.pipeline.extractors.files import FileExtractor, LocalFileSource
 
 from nodestream_plugin_sas.sas7bdat import (
-    Sas7bdatFileFormat,
+    Sas7bdatExtractor,
     _iter_sas7bdat_records,
     _normalize_frame,
 )
 
-SIMPLE_RECORD = {"record": "value"}
 PLUGIN_LOGGER = "nodestream_plugin_sas.sas7bdat"
-CORE_LOGGER = "nodestream.pipeline.extractors.files"
 
 # sample.sas7bdat is pandas' test1.sas7bdat; see tests/data/LICENSE-pandas.
 SAS7BDAT_FIXTURE = Path(__file__).resolve().parent / "data" / "sample.sas7bdat"
@@ -58,8 +54,8 @@ def _sas_preview(records):
     ]
 
 
-async def _records_from(path: Path):
-    subject = FileExtractor([LocalFileSource([path])])
+async def _records_from(path: Path, chunksize: int = 10_000):
+    subject = Sas7bdatExtractor([str(path)], chunksize=chunksize)
     return [record async for record in subject.extract_records()]
 
 
@@ -83,15 +79,6 @@ def sas7bdat_file(tmp_path: Path) -> Path:
     path = tmp_path / "sample.sas7bdat"
     path.write_bytes(SAS7BDAT_FIXTURE.read_bytes())
     return path
-
-
-def test_file_formats_entry_point_is_published():
-    found = [
-        entry
-        for entry in entry_points(group="nodestream.plugins", name="file_formats")
-        if entry.value == "nodestream_plugin_sas.sas7bdat"
-    ]
-    assert found
 
 
 @pytest.mark.asyncio
@@ -132,53 +119,37 @@ async def test_zip_archive_dispatches_each_member(tmp_path: Path, sas7bdat_file:
         archive.writestr("__MACOSX/._one.sas7bdat", b"not a sas file")
         archive.write(sas7bdat_file, "tables/two.SAS7BDAT")
     records = await _records_from(archive_path)
+    assert len(records) == 20
     _assert_sas_records(records[:10])
-    assert records[10] == {"line": "ignore me"}
-    assert records[11] == SIMPLE_RECORD
-    _assert_sas_records(records[12:])
+    _assert_sas_records(records[10:])
 
 
 @pytest.mark.asyncio
 async def test_zip_bad_member_does_not_drop_later_members(
-    tmp_path: Path, sas7bdat_file: Path, mocker, caplog
+    tmp_path: Path, sas7bdat_file: Path, mocker
 ):
     archive_path = tmp_path / "bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("a_corrupt.csv", "record\nvalue\n")
+        archive.writestr("notes/readme.txt", "ignore me")
         archive.writestr("a_bad.sas7bdat", b"this is not a sas7bdat file")
         archive.write(sas7bdat_file, "b_good.sas7bdat")
-    _corrupt_zip_member_crc(archive_path, "a_corrupt.csv")
-    subject = FileExtractor([LocalFileSource([archive_path])])
+    subject = Sas7bdatExtractor([str(archive_path)])
     subject.logger = mocker.Mock()
-    with caplog.at_level(logging.WARNING, logger=CORE_LOGGER):
-        records = [record async for record in subject.extract_records()]
+    records = [record async for record in subject.extract_records()]
     _assert_sas_records(records)
     warning = " ".join(
         str(arg) for call in subject.logger.warning.call_args_list for arg in call.args
     )
     assert "a_bad.sas7bdat" in warning
-    assert "a_corrupt.csv" in caplog.text
     assert "b_good.sas7bdat" not in warning
-    assert "b_good.sas7bdat" not in caplog.text
-
-
-def _corrupt_zip_member_crc(path: Path, member: str) -> None:
-    """Flip one stored payload byte so the member's CRC no longer matches."""
-    with zipfile.ZipFile(path) as archive:
-        offset = archive.getinfo(member).header_offset
-    raw = bytearray(path.read_bytes())
-    name_len = int.from_bytes(raw[offset + 26 : offset + 28], "little")
-    extra_len = int.from_bytes(raw[offset + 28 : offset + 30], "little")
-    data_start = offset + 30 + name_len + extra_len
-    raw[data_start] ^= 0xFF
-    path.write_bytes(raw)
+    assert "readme.txt" not in warning
 
 
 @pytest.mark.asyncio
 async def test_invalid_sas7bdat_is_skipped(tmp_path: Path, mocker):
     path = tmp_path / "bad.sas7bdat"
     path.write_bytes(b"this is not a sas7bdat file")
-    subject = FileExtractor([LocalFileSource([path])])
+    subject = Sas7bdatExtractor([str(path)])
     subject.logger = mocker.Mock()
     assert [record async for record in subject.extract_records()] == []
     message = _warning_message(subject.logger)
@@ -188,9 +159,8 @@ async def test_invalid_sas7bdat_is_skipped(tmp_path: Path, mocker):
 
 
 @pytest.mark.asyncio
-async def test_sas7bdat_chunksize_keeps_column_types(sas7bdat_file: Path, monkeypatch):
-    monkeypatch.setattr(Sas7bdatFileFormat, "chunksize", 2)
-    records = await _records_from(sas7bdat_file)
+async def test_sas7bdat_chunksize_keeps_column_types(sas7bdat_file: Path):
+    records = await _records_from(sas7bdat_file, chunksize=2)
     _assert_sas_records(records)
 
 
@@ -222,9 +192,8 @@ async def test_sas7bdat_bad_text_byte_is_replaced(
 
 @pytest.mark.asyncio
 async def test_replaced_sas_bytes_are_logged_once_per_file(
-    tmp_path: Path, sas7bdat_file: Path, monkeypatch, caplog
+    tmp_path: Path, sas7bdat_file: Path, caplog
 ):
-    monkeypatch.setattr(Sas7bdatFileFormat, "chunksize", 1)
     path = tmp_path / "bad-bytes.sas7bdat"
     data = bytearray(sas7bdat_file.read_bytes())
     data[SAS_ENCODING_OFFSET] = SAS_UTF8_ENCODING
@@ -236,7 +205,7 @@ async def test_replaced_sas_bytes_are_logged_once_per_file(
     data[row1 + 1] = 0xFF
     path.write_bytes(data)
     with caplog.at_level(logging.WARNING, logger=PLUGIN_LOGGER):
-        records = await _records_from(path)
+        records = await _records_from(path, chunksize=1)
     assert records[0]["Column2"] == "p\ufffdar"
     assert records[1]["Column2"] == "d\ufffdg"
     assert caplog.messages == [

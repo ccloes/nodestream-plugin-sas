@@ -1,10 +1,15 @@
-from io import IOBase
+import bz2
+import gzip
+import zipfile
+from glob import glob
+from io import BytesIO, IOBase
 from logging import getLogger
+from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
 from nodestream.model import JsonLikeDocument
-from nodestream.pipeline.extractors.files import FileCodec
+from nodestream.pipeline import Extractor
 
 LOGGER = getLogger(__name__)
 
@@ -166,28 +171,115 @@ def _iter_sas7bdat_records(
         _log_replaced_sas_bytes(replaced, source, replaced_headers)
 
 
-class Sas7bdatFileFormat(FileCodec, alias=".sas7bdat"):
-    """File format codec for SAS sas7bdat files.
+def _expand_globs(patterns: Iterable[str]) -> list[Path]:
+    paths: list[Path] = []
+    for pattern in patterns:
+        paths.extend(Path(match) for match in glob(pattern, recursive=True))
+    return paths
 
-    Each row is a dictionary keyed by column name, like csv.DictReader.
-    Missing values are None and SAS dates are Python datetime objects.
-    SAS stores every number as a float, including whole numbers, so numeric
-    properties stay one type across rows. Cast them later with a normalizer
-    if a pipeline wants integers. Text is decoded with the encoding declared
-    in the file. A byte that does not fit that encoding is replaced, and the
-    rest of the file is still read. An unknown encoding is decoded as latin-1.
-    Rows are read in chunks of `chunksize` (10,000 by default).
 
-    Suffix lookup in nodestream is case-insensitive, so `.SAS7BDAT` uses this
-    codec too.
+def _sas_container(path: Path) -> str | None:
+    """Return how to open a path, or None when it is not a SAS file."""
+    if not path.is_file():
+        return None
+    name = path.name.lower()
+    if name.endswith(".zip"):
+        return "zip"
+    if (
+        name.endswith(".sas7bdat")
+        or name.endswith(".sas7bdat.gz")
+        or name.endswith(".sas7bdat.bz2")
+    ):
+        return "sas"
+    return None
+
+
+def _open_sas(path: Path):
+    name = path.name.lower()
+    if name.endswith(".gz"):
+        return gzip.open(path, "rb")
+    if name.endswith(".bz2"):
+        return bz2.open(path, "rb")
+    return path.open("rb")
+
+
+def _member_is_sas(name: str) -> bool:
+    return Path(name).name.lower().endswith(".sas7bdat")
+
+
+class Sas7bdatExtractor(Extractor):
+    """Read rows from SAS sas7bdat files.
+
+    Each row is a dictionary keyed by column name. Missing values are None
+    and SAS dates are Python datetime objects. SAS stores every number as a
+    float, including whole numbers, so numeric properties stay one type
+    across rows. Cast them later with a normalizer if a pipeline wants
+    integers. Text is decoded with the encoding declared in the file. A byte
+    that does not fit that encoding is replaced, and the rest of the file is
+    still read. An unknown encoding is decoded as latin-1. Rows are read in
+    chunks of `chunksize` (10,000 by default).
+
+    `globs` are filesystem patterns. `.SAS7BDAT` matches the same as
+    `.sas7bdat`. `.gz` and `.bz2` are decompressed first. A `.zip` yields
+    each sas7bdat member and skips the other members.
     """
 
-    chunksize = 10_000
+    def __init__(self, globs: Iterable[str], chunksize: int = 10_000) -> None:
+        self.globs = list(globs)
+        self.chunksize = chunksize
+        self.logger = getLogger(__name__)
 
-    def read_file_from_handle(
-        self, reader: IOBase, source: str | None = None
-    ) -> Iterable[JsonLikeDocument]:
-        if not source:
-            name = getattr(reader, "name", None)
-            source = str(name) if name else "unknown file"
-        return _iter_sas7bdat_records(reader, self.chunksize, source)
+    def _warn_parse_failure(self, source: str, exc: Exception) -> None:
+        self.logger.warning(
+            "Failed to parse %s file (at path %s). "
+            "Please ensure the file is in the correct format.",
+            source,
+            source,
+            extra={"exception": str(exc)},
+        )
+
+    def _records_from_sas(self, path: Path):
+        try:
+            with _open_sas(path) as reader:
+                yield from _iter_sas7bdat_records(reader, self.chunksize, str(path))
+        except Exception as exc:
+            self._warn_parse_failure(str(path), exc)
+
+    def _records_from_zip(self, path: Path):
+        try:
+            archive = zipfile.ZipFile(path)
+        except Exception as exc:
+            self._warn_parse_failure(str(path), exc)
+            return
+        with archive:
+            for info in archive.infolist():
+                if info.is_dir() or not _member_is_sas(info.filename):
+                    continue
+                source = f"{path}:{info.filename}"
+                try:
+                    with archive.open(info) as member:
+                        payload = BytesIO(member.read())
+                    yield from _iter_sas7bdat_records(payload, self.chunksize, source)
+                except Exception as exc:
+                    self._warn_parse_failure(source, exc)
+
+    def _records_from_path(self, path: Path):
+        kind = _sas_container(path)
+        if kind == "zip":
+            yield from self._records_from_zip(path)
+            return
+        if kind == "sas":
+            yield from self._records_from_sas(path)
+            return
+        self.logger.warning("Skipping %s; not a sas7bdat file.", path)
+
+    async def extract_records(self):
+        paths = _expand_globs(self.globs)
+        if not paths:
+            self.logger.warning(
+                "No SAS files found for globs: %s", ", ".join(self.globs)
+            )
+            return
+        for path in paths:
+            for record in self._records_from_path(path):
+                yield record

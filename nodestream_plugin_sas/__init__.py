@@ -1,3 +1,3 @@
-from .sas7bdat import Sas7bdatFileFormat
+from .sas7bdat import Sas7bdatExtractor
 
-__all__ = ("Sas7bdatFileFormat",)
+__all__ = ("Sas7bdatExtractor",)
