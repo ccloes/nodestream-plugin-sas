@@ -1,0 +1,45 @@
+[tool.poetry]
+name = "nodestream-plugin-sas"
+version = "0.1.0"
+description = "Read SAS sas7bdat files from a Nodestream FileExtractor."
+authors = ["Chad Cloes"]
+readme = "README.md"
+license = "Apache-2.0"
+packages = [{ include = "nodestream_plugin_sas" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+# FileExtractor learns file_formats plugins on this branch. Switch to a
+# released nodestream version once that hook is on PyPI.
+nodestream = {git = "https://github.com/ccloes/nodestream.git", branch = "cursor/file-format-plugins-f892"}
+pandas = "^2"
+
+[tool.poetry.plugins."nodestream.plugins"]
+file_formats = "nodestream_plugin_sas.sas7bdat"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.2"
+pytest-asyncio = "^1.0.0"
+pytest-mock = "^3.14.1"
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.isort]
+profile = "black"
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E501"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
